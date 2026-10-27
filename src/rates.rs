@@ -36,7 +36,7 @@ pub fn fmt_rate(bps: f64) -> String {
 }
 
 /// One rate with its last minute of history.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Series {
     pub history: VecDeque<f64>,
 }
@@ -59,7 +59,7 @@ impl Series {
 }
 
 /// Turns the monitor's running byte counts into per-second rates.
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct Rates {
     prev: Option<(Instant, Counters)>,
     pub latest: Counters,
