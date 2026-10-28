@@ -6,6 +6,7 @@ use std::collections::{HashMap, VecDeque};
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::klog;
@@ -23,6 +24,12 @@ const ERROR_EVENT_GAP: Duration = Duration::from_secs(30);
 const RECENT_ERRORS: Duration = Duration::from_secs(60);
 const STOPPED_ACTIVE_FOR: Duration = Duration::from_secs(60);
 const MAX_EVENTS: usize = 2000;
+/// How long a program's repeated log message is kept to one history entry.
+const REPEAT_GAP: Duration = Duration::from_secs(60);
+/// How long running out of USB buffer memory stays on the "Right now" list.
+const USB_MEMORY_ACTIVE_FOR: Duration = Duration::from_secs(300);
+/// Below this usbfs_memory_mb, several SDRs at once can run out of buffers.
+const USB_MEMORY_ENOUGH_MB: u32 = 256;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -73,6 +80,7 @@ enum Stream {
     Stopped(Instant),
 }
 
+#[derive(Clone)]
 pub struct Watcher {
     known: Option<HashMap<String, Known>>,
     hot: HashMap<String, u32>,
@@ -82,9 +90,12 @@ pub struct Watcher {
     last_error: HashMap<String, Instant>,
     prev_lost: u64,
     last_lost_event: Option<Instant>,
+    /// Program log messages already in the history, to collapse repeats.
+    repeats: HashMap<String, (Instant, u32)>,
+    last_usb_memory_error: Option<Instant>,
     pub events: VecDeque<Event>,
     pub active: Vec<Issue>,
-    log: Option<File>,
+    log: Option<Arc<File>>,
     pub log_path: Option<PathBuf>,
 }
 
@@ -130,10 +141,10 @@ impl Watcher {
         Self::with_log(log_path())
     }
 
-    fn with_log(log_path: Option<PathBuf>) -> Self {
+    pub fn with_log(log_path: Option<PathBuf>) -> Self {
         let log = log_path.as_ref().and_then(|p| {
             std::fs::create_dir_all(p.parent()?).ok()?;
-            OpenOptions::new().create(true).append(true).open(p).ok()
+            OpenOptions::new().create(true).append(true).open(p).ok().map(Arc::new)
         });
         let mut w = Watcher {
             known: None,
@@ -144,6 +155,8 @@ impl Watcher {
             last_error: HashMap::new(),
             prev_lost: 0,
             last_lost_event: None,
+            repeats: HashMap::new(),
+            last_usb_memory_error: None,
             events: VecDeque::new(),
             active: Vec::new(),
             log,
@@ -154,9 +167,12 @@ impl Watcher {
     }
 
     fn event(&mut self, severity: Severity, text: String) {
-        let time = now_string();
-        if let Some(f) = &mut self.log {
-            let _ = writeln!(f, "{time}  {:<7}  {text}", severity.tag());
+        self.event_at(now_string(), severity, text);
+    }
+
+    fn event_at(&mut self, time: String, severity: Severity, text: String) {
+        if let Some(f) = &self.log {
+            let _ = writeln!(&**f, "{time}  {:<7}  {text}", severity.tag());
         }
         if self.events.len() == MAX_EVENTS {
             self.events.pop_back();
@@ -221,16 +237,52 @@ impl Watcher {
         }
     }
 
-    pub fn on_kernel_lines(&mut self, lines: Vec<String>, topo: &Topology) {
+    /// Adds log messages to the history, stamped with the time they were
+    /// logged rather than when they arrived here.
+    pub fn on_kernel_lines(&mut self, lines: Vec<klog::LogLine>, topo: &Topology) {
         const MAX_PER_SAMPLE: usize = 20;
-        let total = lines.len();
-        for line in lines.into_iter().take(MAX_PER_SAMPLE) {
+        let now = Instant::now();
+        let mut shown = 0;
+        let mut skipped = 0;
+        for line in lines {
+            if klog::is_usb_memory_error(&line) {
+                self.last_usb_memory_error = Some(now);
+            }
+            if !line.is_kernel() && self.is_repeat(&line, now) {
+                continue;
+            }
+            if shown == MAX_PER_SAMPLE {
+                skipped += 1;
+                continue;
+            }
+            shown += 1;
             let sev = if klog::is_serious(&line) { Severity::Problem } else { Severity::Warning };
-            let text = format!("Kernel: {}{}", line.trim(), device_hint(&line, topo));
-            self.event(sev, text);
+            let text = if line.is_kernel() {
+                format!("Kernel: {}{}", line.text.trim(), device_hint(&line.text, topo))
+            } else {
+                format!("{}: {}{}", line.source, line.text.trim(), program_hint(&line))
+            };
+            self.event_at(line.time.unwrap_or_else(now_string), sev, text);
         }
-        if total > MAX_PER_SAMPLE {
-            self.event(Severity::Warning, format!("Kernel: …and {} more USB messages in the same second", total - MAX_PER_SAMPLE));
+        if skipped > 0 {
+            self.event(Severity::Warning, format!("…and {skipped} more USB messages in the same second"));
+        }
+    }
+
+    /// Programs often log the same error many times a second. Keeps the first
+    /// in the history and counts the rest for a minute.
+    fn is_repeat(&mut self, line: &klog::LogLine, now: Instant) -> bool {
+        let key = format!("{}: {}", line.source, line.text);
+        self.repeats.retain(|_, (t, _)| now.duration_since(*t) < REPEAT_GAP);
+        match self.repeats.get_mut(&key) {
+            Some((_, n)) => {
+                *n += 1;
+                true
+            }
+            None => {
+                self.repeats.insert(key, (now, 0));
+                false
+            }
         }
     }
 
@@ -238,6 +290,8 @@ impl Watcher {
     pub fn on_sample(&mut self, topo: &Topology, rates: &Rates, counters: &traffic::Counters, live: bool) {
         let mut active = Vec::new();
         let now = Instant::now();
+
+        self.check_usb_memory(topo, now, &mut active);
 
         for d in topo.all_devices() {
             if d.below_capable_speed() {
@@ -268,6 +322,37 @@ impl Watcher {
 
         active.sort_by(|a, b| b.severity.cmp(&a.severity));
         self.active = active;
+    }
+
+    /// Programs reading SDRs through libusb share one kernel cap on transfer
+    /// buffer memory (usbfs_memory_mb, 16 MB by default). Fast SDRs can need
+    /// more than that between them, and then streams fail or crash.
+    fn check_usb_memory(&mut self, topo: &Topology, now: Instant, active: &mut Vec<Issue>) {
+        let limit = match topo.usbfs_memory_mb {
+            Some(0) => "no limit".to_string(),
+            Some(mb) => format!("{mb} MB"),
+            None => "unknown".to_string(),
+        };
+        if self.last_usb_memory_error.is_some_and(|t| now.duration_since(t) < USB_MEMORY_ACTIVE_FOR) {
+            active.push(Issue {
+                severity: Severity::Problem,
+                text: format!(
+                    "SDR software ran out of USB buffer memory (libusb errno 12). The kernel's limit is {limit}; raise usbfs_memory_mb (see README)"
+                ),
+                target: None,
+            });
+        } else if let Some(mb @ 1..USB_MEMORY_ENOUGH_MB) = topo.usbfs_memory_mb
+            && topo.sdr_count() >= 2
+        {
+            active.push(Issue {
+                severity: Severity::Warning,
+                text: format!(
+                    "USB buffer memory is limited to {mb} MB for all programs, which is often too little for {} SDRs at once; raise usbfs_memory_mb (see README)",
+                    topo.sdr_count()
+                ),
+                target: None,
+            });
+        }
     }
 
     /// Records how long a link has been busy and logs it when it first counts.
@@ -423,6 +508,15 @@ impl Watcher {
 
 /// " (bladeRF 2.0)" when a kernel line starts with a device we know, e.g.
 /// "usb 2-8.1: reset SuperSpeed USB device".
+/// A plain-English note for program messages whose meaning isn't obvious.
+fn program_hint(line: &klog::LogLine) -> &'static str {
+    if klog::is_usb_memory_error(line) {
+        "  [out of USB buffer memory]"
+    } else {
+        ""
+    }
+}
+
 fn device_hint(line: &str, topo: &Topology) -> String {
     let Some(rest) = line.strip_prefix("usb ") else { return String::new() };
     let Some((name, _)) = rest.split_once(':') else { return String::new() };
@@ -461,6 +555,7 @@ mod tests {
         root.speed_mbps = 20000.0;
         Topology {
             board: String::new(),
+            usbfs_memory_mb: None,
             controllers: vec![Controller {
                 pci_addr: "0000:00:14.0".into(),
                 name: "Intel".into(),
@@ -492,6 +587,31 @@ mod tests {
         assert_eq!(w.events.len(), 3);
         w.on_scan(&topo(vec![hub(7, 8)]));
         assert_eq!(texts(&w)[0], "Connected: Hub on bus 2 port 8");
+    }
+
+    #[test]
+    fn log_lines_keep_their_time_and_flag_buffer_memory() {
+        let mut w = Watcher::with_log(None);
+        let mut t = topo(vec![dev("2-8.1", 4, Some("bladeRF 2.0"), vec![]), dev("2-8.2", 5, Some("bladeRF 2.0"), vec![])]);
+        t.usbfs_memory_mb = Some(16);
+        w.on_sample(&t, &Rates::default(), &traffic::Counters::default(), true);
+        assert_eq!(w.active[0].severity, Severity::Warning, "16 MB with two SDRs: {:?}", w.active);
+
+        let line = "2026-10-27T16:37:45-04:00 rdioa sdrplay_apiService[1988964]: libusb: error [submit_iso_transfer] submiturb failed, errno=12";
+        let lines: Vec<_> = (0..8).filter_map(|_| klog::parse(line)).collect();
+        w.on_kernel_lines(lines, &t);
+        // Eight copies of the same message make one history entry, at the logged time.
+        assert_eq!(w.events.len(), 2);
+        assert_eq!(w.events[0].time, "2026-10-27 16:37:45");
+        assert_eq!(w.events[0].severity, Severity::Problem);
+        w.on_sample(&t, &Rates::default(), &traffic::Counters::default(), true);
+        assert_eq!(w.active[0].severity, Severity::Problem);
+        assert!(w.active[0].text.contains("16 MB"), "{}", w.active[0].text);
+
+        let mut w = Watcher::with_log(None);
+        t.usbfs_memory_mb = Some(1000);
+        w.on_sample(&t, &Rates::default(), &traffic::Counters::default(), true);
+        assert!(w.active.is_empty());
     }
 
     #[test]

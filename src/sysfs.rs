@@ -153,6 +153,9 @@ pub struct Topology {
     /// Motherboard maker and model, e.g. "ASRock X299 Professional Gaming i9".
     pub board: String,
     pub controllers: Vec<Controller>,
+    /// The kernel's cap on memory for all programs' USB transfer buffers
+    /// together (usbcore.usbfs_memory_mb). 0 means no limit.
+    pub usbfs_memory_mb: Option<u32>,
 }
 
 impl Topology {
@@ -373,6 +376,10 @@ pub fn scan(sys_root: &Path, ids: &IdDb) -> std::io::Result<Topology> {
         }
         let Ok(real) = fs::canonicalize(e.path()) else { continue };
         let dev = read_device(&real, &name, ids);
+        // A device caught halfway through connecting has no numbers yet.
+        if dev.busnum == 0 || dev.devnum == 0 {
+            continue;
+        }
         if name.starts_with("usb") {
             roots.push((dev, real));
         } else if let Some(p) = parent_name(&name) {
@@ -435,7 +442,8 @@ pub fn scan(sys_root: &Path, ids: &IdDb) -> std::io::Result<Topology> {
     let dmi = sys_root.join("class/dmi/id");
     let board = format!("{} {}", read(&dmi.join("board_vendor")), read(&dmi.join("board_name"))).trim().to_string();
     controllers.sort_by_key(|c| c.buses.first().map(|b| b.busnum).unwrap_or(0));
-    Ok(Topology { board, controllers })
+    let usbfs_memory_mb = read(&sys_root.join("module/usbcore/parameters/usbfs_memory_mb")).parse().ok();
+    Ok(Topology { board, controllers, usbfs_memory_mb })
 }
 
 #[cfg(test)]

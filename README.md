@@ -101,6 +101,8 @@ The panel along the bottom has two halves.
   below its own recent rate
 - a device with transfer errors in the last minute
 - a USB 3 device stuck at USB 2 speed
+- SDR software running out of USB buffer memory, or a buffer memory limit
+  that's likely too small for the number of SDRs plugged in (see below)
 
 The same problems also turn the matching controller or device red or amber in
 the tree, and the top bar counts them.
@@ -109,12 +111,15 @@ the tree, and the top bar counts them.
 started: devices connecting, disconnecting, or dropping off and reconnecting,
 SDR streams stopping, dropping and recovering, busy links, bursts of transfer
 errors, and USB trouble reported by the kernel (resets, enumeration failures,
-over-current, xHCI and UAS errors, and disk I/O errors from USB drives).
+over-current, xHCI and UAS errors, and disk I/O errors from USB drives), plus
+libusb errors from SDR software and services that crashed. Each entry shows
+the time it actually happened, and monitoring carries on while the window is
+minimized or the screen is locked.
 
 History is also saved to `~/.local/state/usb-monitor/events.log`, so you can
 leave the app running and read what happened later. "Open log folder" opens it.
 
-Kernel messages are read with `journalctl`, which Ubuntu allows for accounts in
+System log messages are read with `journalctl`, which Ubuntu allows for accounts in
 the `adm` group (the first account on a desktop install is). If yours isn't,
 the panel says so, and `sudo usermod -aG adm $USER` followed by logging out and
 back in fixes it.
@@ -122,3 +127,30 @@ back in fixes it.
 ## License
 
 GNU General Public License v3.0. See [LICENSE](LICENSE).
+
+## SDRs failing with "errno=12" (USB buffer memory)
+
+Programs that read SDRs through libusb (SoapySDR, the bladeRF and SDRplay
+libraries, Trunk-Recorder) share one kernel limit on USB transfer buffer
+memory, `usbfs_memory_mb`. Ubuntu's default is 16 MB, which a couple of fast
+SDRs can use up. When that happens the log shows
+`libusb: error [submit_iso_transfer] submiturb failed, errno=12`, streams
+stall, and SDR services can crash. The app flags this in red.
+
+Check the current limit:
+
+```
+cat /sys/module/usbcore/parameters/usbfs_memory_mb
+```
+
+Raise it now (no reboot needed), then restart your SDR software:
+
+```
+echo 1000 | sudo tee /sys/module/usbcore/parameters/usbfs_memory_mb
+```
+
+Keep it raised after every reboot:
+
+```
+echo 'w /sys/module/usbcore/parameters/usbfs_memory_mb - - - - 1000' | sudo tee /etc/tmpfiles.d/usbfs-memory.conf
+```

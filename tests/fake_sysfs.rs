@@ -35,6 +35,7 @@ fn dump_fake_system() {
     // Intel chipset controller on the root bus: a USB 2 and a USB 3 bus.
     let intel = "pci0000:00/0000:00:14.0";
     write(&root.join("devices").join(intel), &[("vendor", "0x8086"), ("device", "0x7ae0"), ("subsystem_vendor", "0x1849")]);
+    write(&root.join("module/usbcore/parameters"), &[("usbfs_memory_mb", "16")]);
     write(&root.join("class/dmi/id"), &[("board_vendor", "ASRock"), ("board_name", "X299 Professional Gaming i9")]);
     usb(&root, intel, "usb1", "usb1", &[("busnum", "1"), ("devnum", "1"), ("speed", "480"), ("bDeviceClass", "09"), ("product", "xHCI Host Controller")]);
     usb(&root, intel, "usb2", "usb2", &[("busnum", "2"), ("devnum", "1"), ("speed", "5000"), ("bDeviceClass", "09")]);

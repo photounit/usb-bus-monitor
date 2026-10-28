@@ -16,6 +16,7 @@ use crate::traffic::{self, Monitor, State};
 
 const RESCAN_EVERY: Duration = Duration::from_secs(2);
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
+const TICK: Duration = Duration::from_millis(200);
 const SETUP_SCRIPT: &str = include_str!("../setup-usbmon.sh");
 
 const GREEN: Color32 = Color32::from_rgb(60, 170, 90);
@@ -29,10 +30,13 @@ pub fn run(sys_root: PathBuf, ids: IdDb, demo: bool) -> eframe::Result {
         viewport: egui::ViewportBuilder::default().with_inner_size([1200.0, 760.0]).with_title("USB Bus Monitor").with_app_id(crate::install::APP_ID),
         ..Default::default()
     };
-    eframe::run_native("USB Bus Monitor", options, Box::new(move |_cc| Ok(Box::new(App::new(sys_root, ids, demo)))))
+    eframe::run_native("USB Bus Monitor", options, Box::new(move |cc| Ok(Box::new(App::new(sys_root, ids, demo, cc.egui_ctx.clone())))))
 }
 
-struct App {
+/// Scanning, sampling and issue checks. These run on their own thread, so
+/// monitoring and the history carry on while the window is minimized or the
+/// screen is locked and nothing is being drawn.
+struct Engine {
     sys_root: PathBuf,
     ids: IdDb,
     topo: Topology,
@@ -41,39 +45,13 @@ struct App {
     last_sample: Instant,
     monitor: Monitor,
     rates: Rates,
-    names: Names,
-    /// sysfs name of the selected device, or `pci:<addr>` for a controller.
-    selected: Option<String>,
-    rename_text: String,
-    setup_result: Arc<Mutex<Option<String>>>,
     watcher: Watcher,
     klog: KernelLog,
+    /// Bumped on every change, so the window only copies new data.
+    generation: u64,
 }
 
-impl App {
-    fn new(sys_root: PathBuf, ids: IdDb, demo: bool) -> Self {
-        let topo = sysfs::scan(&sys_root, &ids).unwrap_or_default();
-        let monitor = if demo { demo_monitor(&topo) } else { Monitor::start() };
-        let mut app = App {
-            sys_root,
-            ids,
-            topo,
-            error: None,
-            last_scan: Instant::now(),
-            last_sample: Instant::now(),
-            monitor,
-            rates: Rates::default(),
-            names: Names::load(),
-            selected: None,
-            rename_text: String::new(),
-            setup_result: Arc::default(),
-            watcher: Watcher::new(),
-            klog: if demo { KernelLog::default() } else { KernelLog::start() },
-        };
-        app.rescan();
-        app
-    }
-
+impl Engine {
     fn rescan(&mut self) {
         match sysfs::scan(&self.sys_root, &self.ids) {
             Ok(t) => {
@@ -84,6 +62,109 @@ impl App {
             Err(e) => self.error = Some(format!("Could not read {}: {e}", self.sys_root.join("bus/usb/devices").display())),
         }
         self.last_scan = Instant::now();
+        self.generation += 1;
+    }
+
+    fn tick(&mut self) {
+        if self.last_scan.elapsed() >= RESCAN_EVERY {
+            self.rescan();
+        }
+        if self.last_sample.elapsed() >= SAMPLE_EVERY {
+            let live = self.monitor.state() == State::Running;
+            self.rates.sample(&self.topo, self.monitor.snapshot());
+            self.watcher.on_kernel_lines(self.klog.drain(), &self.topo);
+            self.watcher.on_sample(&self.topo, &self.rates, &self.rates.latest, live);
+            self.last_sample = Instant::now();
+            self.generation += 1;
+        }
+    }
+}
+
+struct App {
+    engine: Arc<Mutex<Engine>>,
+    seen_generation: u64,
+    // Copies of the engine's latest results, for drawing.
+    topo: Topology,
+    error: Option<String>,
+    rates: Rates,
+    watcher: Watcher,
+    monitor: Monitor,
+    klog: KernelLog,
+    save_error: Option<String>,
+    names: Names,
+    /// sysfs name of the selected device, or `pci:<addr>` for a controller.
+    selected: Option<String>,
+    rename_text: String,
+    setup_result: Arc<Mutex<Option<String>>>,
+}
+
+impl App {
+    fn new(sys_root: PathBuf, ids: IdDb, demo: bool, ctx: egui::Context) -> Self {
+        let topo = sysfs::scan(&sys_root, &ids).unwrap_or_default();
+        let monitor = if demo { demo_monitor(&topo) } else { Monitor::start() };
+        let klog = if demo { KernelLog::default() } else { KernelLog::start() };
+        let mut engine = Engine {
+            sys_root,
+            ids,
+            topo,
+            error: None,
+            last_scan: Instant::now(),
+            last_sample: Instant::now(),
+            monitor: monitor.clone(),
+            rates: Rates::default(),
+            watcher: Watcher::new(),
+            klog: klog.clone(),
+            generation: 0,
+        };
+        engine.rescan();
+        let engine = Arc::new(Mutex::new(engine));
+        let bg = engine.clone();
+        std::thread::spawn(move || loop {
+            std::thread::sleep(TICK);
+            let generation = {
+                let mut e = bg.lock().unwrap();
+                let before = e.generation;
+                e.tick();
+                (e.generation != before).then_some(e.generation)
+            };
+            if generation.is_some() {
+                ctx.request_repaint();
+            }
+        });
+        let mut app = App {
+            engine,
+            seen_generation: u64::MAX,
+            topo: Topology::default(),
+            error: None,
+            rates: Rates::default(),
+            watcher: Watcher::with_log(None),
+            monitor,
+            klog,
+            save_error: None,
+            names: Names::load(),
+            selected: None,
+            rename_text: String::new(),
+            setup_result: Arc::default(),
+        };
+        app.sync();
+        app
+    }
+
+    /// Copies the engine's results if they changed since the last frame.
+    fn sync(&mut self) {
+        let e = self.engine.lock().unwrap();
+        if e.generation != self.seen_generation {
+            self.topo = e.topo.clone();
+            self.error = e.error.clone();
+            self.rates = e.rates.clone();
+            self.watcher = e.watcher.clone();
+            self.seen_generation = e.generation;
+        }
+    }
+
+    fn rescan(&mut self) {
+        self.engine.lock().unwrap().rescan();
+        self.sync();
     }
 
     fn controller_title(&self, c: &Controller) -> String {
@@ -130,16 +211,9 @@ fn demo_monitor(topo: &Topology) -> Monitor {
 
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        if self.last_scan.elapsed() >= RESCAN_EVERY {
-            self.rescan();
-        }
+        self.sync();
         let state = self.monitor.state();
-        if self.last_sample.elapsed() >= SAMPLE_EVERY {
-            self.rates.sample(&self.topo, self.monitor.snapshot());
-            self.watcher.on_kernel_lines(self.klog.drain(), &self.topo);
-            self.watcher.on_sample(&self.topo, &self.rates, &self.rates.latest, state == State::Running);
-            self.last_sample = Instant::now();
-        }
+        // The engine asks for a repaint when it has new data; this is a backstop.
         ui.ctx().request_repaint_after(SAMPLE_EVERY);
 
         egui::Panel::top("summary").show(ui, |ui| {
@@ -200,7 +274,7 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().show(ui, |ui| {
-            if let Some(e) = &self.error {
+            for e in [&self.error, &self.save_error].into_iter().flatten() {
                 ui.colored_label(RED, e);
             }
             let live = state == State::Running;
@@ -227,7 +301,7 @@ impl App {
                 }
                 if !*self.klog.running.lock().unwrap() && self.monitor.state() == State::Running {
                     ui.add_space(6.0);
-                    ui.weak("Kernel USB messages aren't being read (journalctl isn't available to this account), so resets and errors the kernel reports won't appear in the history.");
+                    ui.weak("System log messages aren't being read (journalctl isn't available to this account), so USB resets, errors and SDR software crashes won't appear in the history.");
                 }
             });
 
@@ -396,7 +470,7 @@ impl App {
                 ui.add(egui::TextEdit::singleline(&mut self.rename_text).hint_text("e.g. Renesas card, top slot").desired_width(220.0));
                 if ui.button("Save").clicked() {
                     if let Err(e) = self.names.set(addr, &self.rename_text) {
-                        self.error = Some(format!("Couldn't save the name: {e}"));
+                        self.save_error = Some(format!("Couldn't save the name: {e}"));
                     }
                 }
             });
