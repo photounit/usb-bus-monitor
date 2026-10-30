@@ -553,7 +553,8 @@ fn usage_color(frac: f64) -> Color32 {
 }
 
 fn usage_bar(ui: &mut egui::Ui, used: f64, link_mbps: f64, frac: f64) {
-    let text = format!("{:.0}% busy  ·  {} of about {} usable", frac * 100.0, fmt_rate(used), fmt_rate(usable_bytes_per_sec(link_mbps)));
+    let used = if used > 0.0 { fmt_rate(used) } else { "0 B/s".into() };
+    let text = format!("{:.0}% busy  ·  {used} of about {} usable", frac * 100.0, fmt_rate(usable_bytes_per_sec(link_mbps)));
     ui.horizontal(|ui| {
         ui.add(egui::ProgressBar::new(frac.min(1.0) as f32).desired_width(160.0).desired_height(10.0).fill(usage_color(frac)));
         ui.label(RichText::new(text).color(usage_color(frac)));
