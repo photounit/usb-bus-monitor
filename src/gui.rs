@@ -318,9 +318,12 @@ impl App {
                 }
             });
             egui::ScrollArea::vertical().id_salt("history").auto_shrink([false; 2]).show(&mut cols[1], |ui| {
+                let today = crate::issues::now_string()[..10].to_string();
                 for e in &self.watcher.events {
                     ui.horizontal_wrapped(|ui| {
-                        ui.weak(&e.time[11..]);
+                        // Just the time for today's entries; month and day too for older ones.
+                        let when = if e.time.starts_with(&today) { &e.time[11..] } else { &e.time[5..] };
+                        ui.weak(when);
                         ui.colored_label(severity_color(e.severity), &e.text);
                     });
                 }
