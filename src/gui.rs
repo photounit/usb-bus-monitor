@@ -220,6 +220,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 let devices = self.topo.all_devices().iter().filter(|d| !d.sysname.starts_with("usb")).count();
                 ui.heading("USB Bus Monitor");
+                ui.weak(concat!("v", env!("CARGO_PKG_VERSION")));
                 ui.separator();
                 if !self.topo.board.is_empty() {
                     ui.label(&self.topo.board);
@@ -317,9 +318,12 @@ impl App {
                 }
             });
             egui::ScrollArea::vertical().id_salt("history").auto_shrink([false; 2]).show(&mut cols[1], |ui| {
+                let today = crate::issues::now_string()[..10].to_string();
                 for e in &self.watcher.events {
                     ui.horizontal_wrapped(|ui| {
-                        ui.weak(&e.time[11..]);
+                        // Just the time for today's entries; month and day too for older ones.
+                        let when = if e.time.starts_with(&today) { &e.time[11..] } else { &e.time[5..] };
+                        ui.weak(when);
                         ui.colored_label(severity_color(e.severity), &e.text);
                     });
                 }
@@ -553,7 +557,8 @@ fn usage_color(frac: f64) -> Color32 {
 }
 
 fn usage_bar(ui: &mut egui::Ui, used: f64, link_mbps: f64, frac: f64) {
-    let text = format!("{:.0}% busy  ·  {} of about {} usable", frac * 100.0, fmt_rate(used), fmt_rate(usable_bytes_per_sec(link_mbps)));
+    let used = if used > 0.0 { fmt_rate(used) } else { "0 B/s".into() };
+    let text = format!("{:.0}% busy  ·  {used} of about {} usable", frac * 100.0, fmt_rate(usable_bytes_per_sec(link_mbps)));
     ui.horizontal(|ui| {
         ui.add(egui::ProgressBar::new(frac.min(1.0) as f32).desired_width(160.0).desired_height(10.0).fill(usage_color(frac)));
         ui.label(RichText::new(text).color(usage_color(frac)));

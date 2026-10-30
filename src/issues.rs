@@ -69,7 +69,9 @@ struct Known {
     devnum: u32,
     ids: (u16, u16),
     name: String,
-    is_sdr: bool,
+    /// SDRs and drives, whose dropouts lose data. Others (hubs, monitors,
+    /// keyboards) often reconnect harmlessly, e.g. when a monitor wakes.
+    important: bool,
     place: String,
 }
 
@@ -112,6 +114,10 @@ pub fn now_string() -> String {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe { libc::localtime_r(&t, &mut tm) };
     format!("{:04}-{:02}-{:02} {:02}:{:02}:{:02}", tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
+fn is_important(d: &Device) -> bool {
+    d.sdr.is_some() || d.drivers.iter().any(|drv| drv == "uas" || drv == "usb-storage")
 }
 
 fn place(d: &Device) -> String {
@@ -196,7 +202,7 @@ impl Watcher {
             .into_iter()
             .filter(|d| !d.sysname.starts_with("usb"))
             .map(|d| {
-                let k = Known { devnum: d.devnum, ids: (d.vendor_id, d.product_id), name: label(d), is_sdr: d.sdr.is_some(), place: place(d) };
+                let k = Known { devnum: d.devnum, ids: (d.vendor_id, d.product_id), name: label(d), important: is_important(d), place: place(d) };
                 (d.sysname.clone(), k)
             })
             .collect();
@@ -213,7 +219,7 @@ impl Watcher {
             match (before.get(name), now.get(name)) {
                 (Some(old), None) => {
                     if !parent_changed(name, &|p| before.contains_key(p) && !now.contains_key(p)) {
-                        let sev = if old.is_sdr { Severity::Problem } else { Severity::Warning };
+                        let sev = if old.important { Severity::Problem } else { Severity::Warning };
                         self.event(sev, format!("Disconnected: {} from {}", old.name, old.place));
                     }
                 }
@@ -226,7 +232,8 @@ impl Watcher {
                     let reconnected = |p: &str| matches!((before.get(p), now.get(p)), (Some(a), Some(b)) if a.devnum != b.devnum);
                     if !parent_changed(name, &reconnected) {
                         if old.ids == new.ids {
-                            self.event(Severity::Problem, format!("Dropped off and reconnected: {} on {}", new.name, new.place));
+                            let sev = if new.important { Severity::Problem } else { Severity::Warning };
+                            self.event(sev, format!("Dropped off and reconnected: {} on {}", new.name, new.place));
                         } else {
                             self.event(Severity::Info, format!("Swapped: {} replaced by {} on {}", old.name, new.name, new.place));
                         }
@@ -587,6 +594,27 @@ mod tests {
         assert_eq!(w.events.len(), 3);
         w.on_scan(&topo(vec![hub(7, 8)]));
         assert_eq!(texts(&w)[0], "Connected: Hub on bus 2 port 8");
+        assert_eq!(w.events[0].severity, Severity::Info);
+    }
+
+    #[test]
+    fn reconnect_severity() {
+        let mut w = Watcher::with_log(None);
+        let mut drive = dev("2-2", 9, None, vec![]);
+        drive.is_hub = false;
+        drive.drivers = vec!["uas".into()];
+        let scan = |hub_num, drive_num| {
+            let mut d = drive.clone();
+            d.devnum = drive_num;
+            topo(vec![dev("2-8", hub_num, None, vec![]), d])
+        };
+        w.on_scan(&scan(3, 9));
+        // A monitor's hub reconnecting is worth noting, not alarming.
+        w.on_scan(&scan(4, 9));
+        assert_eq!(w.events[0].severity, Severity::Warning, "{:?}", texts(&w));
+        // A drive reconnecting can lose data.
+        w.on_scan(&scan(4, 10));
+        assert_eq!(w.events[0].severity, Severity::Problem, "{:?}", texts(&w));
     }
 
     #[test]
