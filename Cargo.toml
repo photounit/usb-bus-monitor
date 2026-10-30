@@ -1,6 +1,6 @@
 [package]
 name = "usb-monitor"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 description = "Desktop monitor for USB buses, ports and SDR traffic on Linux"
 license-file = "LICENSE"

@@ -220,6 +220,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 let devices = self.topo.all_devices().iter().filter(|d| !d.sysname.starts_with("usb")).count();
                 ui.heading("USB Bus Monitor");
+                ui.weak(concat!("v", env!("CARGO_PKG_VERSION")));
                 ui.separator();
                 if !self.topo.board.is_empty() {
                     ui.label(&self.topo.board);

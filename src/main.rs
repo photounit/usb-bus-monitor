@@ -27,12 +27,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             // Made-up traffic, for screenshots on machines without SDRs.
             "--demo-traffic" => demo = true,
             "--sys-root" => sys_root = args.next().ok_or("--sys-root needs a path")?.into(),
+            "-V" | "--version" => {
+                println!("USB Bus Monitor {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
             "-h" | "--help" => {
                 println!(
-                    "usb-monitor [--install | --uninstall | --dump] [--sys-root PATH]\n\n  \
+                    "usb-monitor [--install | --uninstall | --dump | --version] [--sys-root PATH]\n\n  \
                      --install        add USB Bus Monitor to the app menu (no sudo needed)\n  \
                      --uninstall      remove it from the app menu\n  \
                      --dump           print the USB layout as text instead of opening the window\n  \
+                     --version        print the version number\n  \
                      --sys-root PATH  read a copy of /sys from PATH (for testing)"
                 );
                 return Ok(());
