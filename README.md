@@ -103,6 +103,26 @@ The panel along the bottom has two halves.
 - a USB 3 device stuck at USB 2 speed
 - SDR software running out of USB buffer memory, or a buffer memory limit
   that's likely too small for the number of SDRs plugged in (see below)
+- an SDR whose USB data had a short gap (one second well below its normal
+  rate), which means samples were lost before reaching the computer
+- a program reading an SDR whose busiest thread has used 90% or more of a CPU
+  core for 5 seconds. It can't keep up, so the SDR software drops samples
+  inside the computer even though USB delivered them all
+
+### "My SDR program says it's dropping samples"
+
+Click the SDR and look at **Is it keeping up?** in the details panel:
+
+- **Sample rate** works out the rate from the USB data (Airspy, RTL-SDR and
+  HackRF). If it matches what you set, every sample arrived over USB.
+- **USB delivery** says whether the data has had any gaps.
+- **Busiest thread** shows how hard the program reading the SDR is working.
+  Near 100% of one core means it's falling behind. The PC's overall CPU figure
+  hides this: one maxed-out thread on a 36-thread CPU is under 3%.
+
+If USB delivery is steady and the program still reports drops, the samples
+were lost inside the computer, not on the USB bus. The program has to be
+visible to the monitor for the thread check, so run both as the same user.
 
 The same problems also turn the matching controller or device red or amber in
 the tree, and the top bar counts them.

@@ -10,12 +10,16 @@ use crate::ids::IdDb;
 use crate::issues::{Severity, Watcher};
 use crate::klog::KernelLog;
 use crate::names::Names;
+use crate::procs::Tracker;
 use crate::sysfs::{self, Controller, ControllerKind, Device, Topology};
+use crate::sdr;
 use crate::rates::{fmt_rate, usable_bytes_per_sec, Rates, Series, HISTORY_SECS};
 use crate::traffic::{self, Monitor, State};
 
 const RESCAN_EVERY: Duration = Duration::from_secs(2);
 const SAMPLE_EVERY: Duration = Duration::from_secs(1);
+/// How often to look for which programs have USB devices open.
+const OWNER_SCAN_EVERY: Duration = Duration::from_secs(5);
 const TICK: Duration = Duration::from_millis(200);
 const SETUP_SCRIPT: &str = include_str!("../setup-usbmon.sh");
 
@@ -47,6 +51,8 @@ struct Engine {
     rates: Rates,
     watcher: Watcher,
     klog: KernelLog,
+    procs: Tracker,
+    last_owner_scan: Option<Instant>,
     /// Bumped on every change, so the window only copies new data.
     generation: u64,
 }
@@ -71,9 +77,15 @@ impl Engine {
         }
         if self.last_sample.elapsed() >= SAMPLE_EVERY {
             let live = self.monitor.state() == State::Running;
+            let proc_root = std::path::Path::new("/proc");
+            if self.last_owner_scan.is_none_or(|t| t.elapsed() >= OWNER_SCAN_EVERY) {
+                self.procs.find_owners(proc_root);
+                self.last_owner_scan = Some(Instant::now());
+            }
+            self.procs.sample(proc_root);
             self.rates.sample(&self.topo, self.monitor.snapshot());
             self.watcher.on_kernel_lines(self.klog.drain(), &self.topo);
-            self.watcher.on_sample(&self.topo, &self.rates, &self.rates.latest, live);
+            self.watcher.on_sample(&self.topo, &self.rates, &self.rates.latest, &self.procs, live);
             self.last_sample = Instant::now();
             self.generation += 1;
         }
@@ -90,6 +102,7 @@ struct App {
     watcher: Watcher,
     monitor: Monitor,
     klog: KernelLog,
+    procs: Tracker,
     save_error: Option<String>,
     names: Names,
     /// sysfs name of the selected device, or `pci:<addr>` for a controller.
@@ -114,6 +127,8 @@ impl App {
             rates: Rates::default(),
             watcher: Watcher::new(),
             klog: klog.clone(),
+            procs: Tracker::default(),
+            last_owner_scan: None,
             generation: 0,
         };
         engine.rescan();
@@ -140,6 +155,7 @@ impl App {
             watcher: Watcher::with_log(None),
             monitor,
             klog,
+            procs: Tracker::default(),
             save_error: None,
             names: Names::load(),
             selected: None,
@@ -158,6 +174,7 @@ impl App {
             self.error = e.error.clone();
             self.rates = e.rates.clone();
             self.watcher = e.watcher.clone();
+            self.procs = e.procs.clone();
             self.seen_generation = e.generation;
         }
     }
@@ -405,7 +422,11 @@ impl App {
             text = format!("📻 {text}  ·  {kind}");
         }
         if live {
-            text += &format!("  ·  {}", fmt_rate(self.rates.device(d).map_or(0.0, Series::now)));
+            let now = self.rates.device(d).map_or(0.0, Series::now);
+            text += &format!("  ·  {}", fmt_rate(now));
+            if let Some(r) = d.sdr.and_then(|k| sdr::sample_rate(k, now)) {
+                text += &format!(" (≈ {:.1} MS/s)", r.msps);
+            }
         }
         let errors = self.rates.errors(d).map_or(0, |c| c.errors);
         if errors > 0 {
@@ -529,6 +550,9 @@ impl App {
             ui.add_space(8.0);
             ui.label(RichText::new(format!("Traffic  ·  now {}  ·  peak {}", fmt_rate(s.map_or(0.0, Series::now)), fmt_rate(s.map_or(0.0, Series::peak)))).strong());
             graph(ui, s, None);
+            if d.sdr.is_some() {
+                self.sdr_health(ui, d, s);
+            }
         }
         if let Some(c) = self.rates.errors(d) {
             ui.add_space(8.0);
@@ -543,6 +567,53 @@ impl App {
             ui.add_space(8.0);
             ui.colored_label(AMBER, format!("⚠ This device supports USB {} but is running at {}. Check the port, cable or hub it goes through.", d.usb_version, sysfs::speed_name(d.speed_mbps)));
         }
+    }
+}
+
+impl App {
+    /// What the SDR's data rate means, whether USB delivered it steadily, and
+    /// whether the program reading it is keeping up.
+    fn sdr_health(&self, ui: &mut egui::Ui, d: &Device, s: Option<&Series>) {
+        let now = s.map_or(0.0, Series::now);
+        ui.add_space(8.0);
+        ui.label(RichText::new("Is it keeping up?").strong().color(PURPLE));
+        egui::Grid::new("sdr").num_columns(2).striped(true).show(ui, |ui| {
+            if let Some(r) = d.sdr.and_then(|k| sdr::sample_rate(k, now)) {
+                row(ui, "Sample rate", format!("≈ {:.1} MS/s ({}), from the USB data rate", r.msps, r.note));
+            }
+            let dips = self.watcher.dips.get(&d.sysname).copied().unwrap_or(0);
+            let steady = s.is_some_and(|s| s.history.len() >= 15);
+            let usb = match (dips, steady) {
+                (0, true) => RichText::new("✓ Steady, no gaps since the monitor started").color(GREEN),
+                (0, false) => RichText::new("Watching…"),
+                (n, _) => RichText::new(format!("⚠ {n} short gap{} since the monitor started", if n == 1 { "" } else { "s" })).color(AMBER),
+            };
+            ui.label("USB delivery");
+            ui.label(usb);
+            ui.end_row();
+            match self.procs.user(d.busnum, d.devnum) {
+                Some(u) => {
+                    row(ui, "Read by", format!("{} (process {})", u.name, u.pid));
+                    let color = if u.busiest_pct >= 90.0 {
+                        RED
+                    } else if u.busiest_pct >= 70.0 {
+                        AMBER
+                    } else {
+                        GREEN
+                    };
+                    ui.label("Busiest thread");
+                    ui.label(RichText::new(format!("{:.0}% of one CPU core (\"{}\")", u.busiest_pct, u.busiest_thread)).color(color));
+                    ui.end_row();
+                    row(ui, "Whole program", format!("{:.0}% of one core", u.total_pct));
+                }
+                None if self.procs.has_owner(d.busnum, d.devnum) => row(ui, "Read by", "measuring…"),
+                None if now > 0.0 => row(ui, "Read by", "a program this monitor can't see (it may run as another user or as root)"),
+                None => row(ui, "Read by", "nothing right now"),
+            }
+        });
+        ui.weak(
+            "If your SDR program reports dropped samples while USB delivery here is steady, the samples arrived over USB and were lost inside the computer: the program, or one of its threads, fell behind. A busiest thread near 100% is the usual sign.",
+        );
     }
 }
 

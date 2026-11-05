@@ -10,6 +10,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::klog;
+use crate::procs;
 use crate::rates::{fmt_rate, usable_bytes_per_sec, Rates};
 use crate::sysfs::{self, Controller, Device, Topology};
 use crate::traffic;
@@ -30,6 +31,14 @@ const REPEAT_GAP: Duration = Duration::from_secs(60);
 const USB_MEMORY_ACTIVE_FOR: Duration = Duration::from_secs(300);
 /// Below this usbfs_memory_mb, several SDRs at once can run out of buffers.
 const USB_MEMORY_ENOUGH_MB: u32 = 256;
+/// One second below this share of an SDR's usual rate is a gap in its USB data.
+const DIP: f64 = 0.85;
+/// How long a gap stays on the "Right now" list.
+const DIP_ACTIVE_FOR: Duration = Duration::from_secs(60);
+/// A thread using this much of one CPU core can't take on any more work.
+const THREAD_MAXED: f64 = 90.0;
+/// Seconds a thread must stay maxed out before it's reported.
+const THREAD_MAXED_SECS: u32 = 5;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Severity {
@@ -95,6 +104,13 @@ pub struct Watcher {
     /// Program log messages already in the history, to collapse repeats.
     repeats: HashMap<String, (Instant, u32)>,
     last_usb_memory_error: Option<Instant>,
+    /// Short gaps in each SDR's USB data since the monitor started, by device.
+    pub dips: HashMap<String, u32>,
+    /// When each SDR last had a gap, and when one was last written to the history.
+    last_dip: HashMap<String, Instant>,
+    last_dip_event: HashMap<String, Instant>,
+    /// Seconds in a row each program's busiest thread has been maxed out, by pid.
+    maxed: HashMap<u32, u32>,
     pub events: VecDeque<Event>,
     pub active: Vec<Issue>,
     log: Option<Arc<File>>,
@@ -163,6 +179,10 @@ impl Watcher {
             last_lost_event: None,
             repeats: HashMap::new(),
             last_usb_memory_error: None,
+            dips: HashMap::new(),
+            last_dip: HashMap::new(),
+            last_dip_event: HashMap::new(),
+            maxed: HashMap::new(),
             events: VecDeque::new(),
             active: Vec::new(),
             log,
@@ -295,7 +315,7 @@ impl Watcher {
     }
 
     /// Checks rates and error counters after each one-second sample.
-    pub fn on_sample(&mut self, topo: &Topology, rates: &Rates, counters: &traffic::Counters, live: bool) {
+    pub fn on_sample(&mut self, topo: &Topology, rates: &Rates, counters: &traffic::Counters, procs: &procs::Tracker, live: bool) {
         let mut active = Vec::new();
         let now = Instant::now();
 
@@ -317,6 +337,7 @@ impl Watcher {
             }
             self.check_streams(topo, rates, now, &mut active);
             self.check_errors(topo, counters, now, &mut active);
+            self.check_programs(topo, procs, &mut active);
 
             if counters.lost_events > self.prev_lost {
                 let n = counters.lost_events - self.prev_lost;
@@ -467,6 +488,29 @@ impl Watcher {
             };
 
             let name = label(d);
+            // A single short second, with the stream back to normal straight after
+            // (so it wasn't the start of a stop): the SDR had to throw samples
+            // away because nothing collected them in time.
+            let before_last = h[h.len() - 2];
+            if prev == Stream::Normal && next == Stream::Normal && baseline > STREAMING && before_last < DIP * baseline && last >= DIP * baseline {
+                let last = before_last;
+                *self.dips.entry(d.sysname.clone()).or_default() += 1;
+                self.last_dip.insert(d.sysname.clone(), now);
+                if self.last_dip_event.get(&d.sysname).is_none_or(|t| now.duration_since(*t) >= ERROR_EVENT_GAP) {
+                    self.last_dip_event.insert(d.sysname.clone(), now);
+                    self.event(
+                        Severity::Warning,
+                        format!("{name} had a gap in its USB data: {} for one second instead of about {} ({})", fmt_rate(last), fmt_rate(baseline), place(d)),
+                    );
+                }
+            }
+            if next == Stream::Normal && self.last_dip.get(&d.sysname).is_some_and(|t| now.duration_since(*t) < DIP_ACTIVE_FOR) {
+                active.push(Issue {
+                    severity: Severity::Warning,
+                    text: format!("{name} had gaps in its USB data in the last minute, so samples were lost before reaching the computer ({})", place(d)),
+                    target: Some(d.sysname.clone()),
+                });
+            }
             match (prev, next) {
                 (Stream::Normal | Stream::Low, Stream::Stopped(_)) => {
                     self.event(Severity::Problem, format!("{name} stopped streaming (was {})", fmt_rate(baseline)));
@@ -521,6 +565,40 @@ impl Watcher {
                     target: Some(d.sysname.clone()),
                 });
             }
+        }
+    }
+}
+
+impl Watcher {
+    /// Flags SDR programs whose busiest thread is using a whole CPU core.
+    /// Such a program falls behind and drops samples inside the computer,
+    /// while the USB data itself looks perfect.
+    fn check_programs(&mut self, topo: &Topology, procs: &procs::Tracker, active: &mut Vec<Issue>) {
+        let mut seen = HashMap::new();
+        for d in topo.all_devices().into_iter().filter(|d| d.sdr.is_some()) {
+            if let Some(u) = procs.user(d.busnum, d.devnum) {
+                seen.entry(u.pid).or_insert_with(|| (u.clone(), Vec::new())).1.push(d);
+            }
+        }
+        self.maxed.retain(|pid, _| seen.contains_key(pid));
+        let mut pids: Vec<_> = seen.keys().copied().collect();
+        pids.sort();
+        for pid in pids {
+            let (u, devs) = &seen[&pid];
+            let n = self.maxed.entry(pid).or_default();
+            *n = if u.busiest_pct >= THREAD_MAXED { *n + 1 } else { 0 };
+            if *n < THREAD_MAXED_SECS {
+                continue;
+            }
+            let sdrs = devs.iter().map(|d| format!("{} on {}", label(d), place(d))).collect::<Vec<_>>().join(", ");
+            let text = format!(
+                "{} has a thread (\"{}\") using {:.0}% of a CPU core. It reads {sdrs}; a maxed-out thread falls behind and the SDR software drops samples inside the computer, even though USB delivers them all",
+                u.name, u.busiest_thread, u.busiest_pct
+            );
+            if *n == THREAD_MAXED_SECS {
+                self.event(Severity::Warning, text.clone());
+            }
+            active.push(Issue { severity: Severity::Warning, text, target: devs.first().map(|d| d.sysname.clone()) });
         }
     }
 }
@@ -639,7 +717,7 @@ mod tests {
         let mut w = Watcher::with_log(None);
         let mut t = topo(vec![dev("2-8.1", 4, Some("bladeRF 2.0"), vec![]), dev("2-8.2", 5, Some("bladeRF 2.0"), vec![])]);
         t.usbfs_memory_mb = Some(16);
-        w.on_sample(&t, &Rates::default(), &traffic::Counters::default(), true);
+        w.on_sample(&t, &Rates::default(), &traffic::Counters::default(), &procs::Tracker::default(), true);
         assert_eq!(w.active[0].severity, Severity::Warning, "16 MB with two SDRs: {:?}", w.active);
 
         let line = "2026-10-27T16:37:45-04:00 rdioa sdrplay_apiService[1988964]: libusb: error [submit_iso_transfer] submiturb failed, errno=12";
@@ -649,19 +727,19 @@ mod tests {
         assert_eq!(w.events.len(), 2);
         assert_eq!(w.events[0].time, "2026-10-27 16:37:45");
         assert_eq!(w.events[0].severity, Severity::Problem);
-        w.on_sample(&t, &Rates::default(), &traffic::Counters::default(), true);
+        w.on_sample(&t, &Rates::default(), &traffic::Counters::default(), &procs::Tracker::default(), true);
         assert_eq!(w.active[0].severity, Severity::Problem);
         assert!(w.active[0].text.contains("16 MB"), "{}", w.active[0].text);
 
         let mut w = Watcher::with_log(None);
         t.usbfs_memory_mb = Some(1000);
-        w.on_sample(&t, &Rates::default(), &traffic::Counters::default(), true);
+        w.on_sample(&t, &Rates::default(), &traffic::Counters::default(), &procs::Tracker::default(), true);
         assert!(w.active.is_empty());
 
         // With a generous limit the same error is only a warning.
         w.on_kernel_lines(klog::parse(line).into_iter().collect(), &t);
         assert_eq!(w.events[0].severity, Severity::Warning);
-        w.on_sample(&t, &Rates::default(), &traffic::Counters::default(), true);
+        w.on_sample(&t, &Rates::default(), &traffic::Counters::default(), &procs::Tracker::default(), true);
         assert_eq!(w.active[0].severity, Severity::Warning);
         assert!(w.active[0].text.contains("although the limit is 1000 MB"), "{}", w.active[0].text);
     }
@@ -674,7 +752,7 @@ mod tests {
         let feed = |w: &mut Watcher, rates: &mut Rates, v: f64, secs: usize| {
             for _ in 0..secs {
                 rates.devices.entry("2-8.2".into()).or_insert_with(Series::default).push(v);
-                w.on_sample(&t, rates, &traffic::Counters::default(), true);
+                w.on_sample(&t, rates, &traffic::Counters::default(), &procs::Tracker::default(), true);
             }
         };
         feed(&mut w, &mut rates, 120e6, 20);
@@ -687,6 +765,33 @@ mod tests {
         assert!(texts(&w)[0].starts_with("bladeRF 2.0 back to normal"), "{:?}", texts(&w));
         feed(&mut w, &mut rates, 70e6, 4);
         assert!(texts(&w)[0].starts_with("bladeRF 2.0 data rate dropped from 120.0 MB/s"), "{:?}", texts(&w));
+    }
+
+    #[test]
+    fn short_gap_in_usb_data() {
+        let mut w = Watcher::with_log(None);
+        let t = topo(vec![dev("2-8.2", 5, Some("Airspy"), vec![])]);
+        let mut rates = Rates::default();
+        let feed = |w: &mut Watcher, rates: &mut Rates, v: f64, secs: usize| {
+            for _ in 0..secs {
+                rates.devices.entry("2-8.2".into()).or_insert_with(Series::default).push(v);
+                w.on_sample(&t, rates, &traffic::Counters::default(), &procs::Tracker::default(), true);
+            }
+        };
+        // Normal wobble from transfer sizes is not a gap.
+        for _ in 0..10 {
+            feed(&mut w, &mut rates, 18.0e6, 1);
+            feed(&mut w, &mut rates, 17.0e6, 1);
+        }
+        assert!(w.active.is_empty(), "{:?}", w.active);
+        assert_eq!(w.dips.get("2-8.2"), None);
+        feed(&mut w, &mut rates, 12.0e6, 1);
+        feed(&mut w, &mut rates, 18.0e6, 1);
+        assert_eq!(w.dips["2-8.2"], 1);
+        assert!(texts(&w)[0].contains("had a gap in its USB data: 12.0 MB/s for one second"), "{:?}", texts(&w));
+        feed(&mut w, &mut rates, 18.0e6, 4);
+        assert_eq!(w.active.len(), 1, "{:?}", w.active);
+        assert_eq!(w.active[0].severity, Severity::Warning);
     }
 
     #[test]
