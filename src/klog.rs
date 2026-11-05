@@ -89,7 +89,13 @@ pub fn is_interesting(l: &LogLine) -> bool {
 /// services that crashed.
 fn is_interesting_program(text: &str) -> bool {
     let t = text.to_ascii_lowercase();
-    t.starts_with("libusb: error") || t.contains("libusb_error") || t.contains("exited, code=dumped")
+    t.starts_with("libusb: error") || t.contains("libusb_error") || t.contains("exited, code=dumped") || is_sample_drop(&t)
+}
+
+/// SDR software saying it lost samples, e.g. "Dropped 262144 samples" or
+/// "dropping samples".
+fn is_sample_drop(lower: &str) -> bool {
+    (lower.contains("dropped") || lower.contains("dropping")) && lower.contains("sample")
 }
 
 /// Kernel messages. Plain connects and disconnects are left out because the
@@ -170,6 +176,12 @@ mod tests {
 
         assert!(is_interesting_text("sdrplay_apiServ[1989141]: segfault at 20 ip 00007073e755299e sp 00007073dda7ab70 error 4 in libusb-1.0.so.0.5.0[d99e,7073e754a000+11000]"));
         assert!(parse("-- No entries --").is_none());
+    }
+
+    #[test]
+    fn picks_up_sample_drops() {
+        assert!(is_interesting(&parse("2026-11-05T00:07:01-05:00 rdio trunk-recorder[811]: [airspy] Dropped 1200000 samples").unwrap()));
+        assert!(!is_interesting(&parse("2026-11-05T00:07:01-05:00 rdio trunk-recorder[811]: Dropped call 12").unwrap()));
     }
 
     #[test]

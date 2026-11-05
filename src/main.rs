@@ -4,6 +4,7 @@ mod install;
 mod issues;
 mod klog;
 mod names;
+mod procs;
 mod rates;
 mod sdr;
 mod sysfs;
