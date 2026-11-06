@@ -369,7 +369,7 @@ impl Watcher {
             active.push(Issue {
                 severity: Severity::Warning,
                 text: format!(
-                    "SDR software couldn't get USB buffer memory (libusb errno 12) although the limit is {limit}. Usually brief and harmless unless an SDR also stops streaming"
+                    "SDR software couldn't get USB buffer memory (libusb errno 12) although the limit is {limit}. Free memory is likely short or fragmented; repeats can crash the SDRplay service (see README)"
                 ),
                 target: None,
             });

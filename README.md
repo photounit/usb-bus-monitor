@@ -159,8 +159,18 @@ stall, and SDR services can crash. The app flags this in red.
 
 If the limit is already 256 MB or more (or 0, meaning no limit), the app shows
 the same error in amber instead. Then raising the limit won't help: the kernel
-briefly couldn't find a large enough block of memory, and the SDR software
-retries. It's harmless unless an SDR also stops streaming.
+couldn't find a large enough unbroken block of free memory for the transfer.
+One now and then is retried, but a few in a row can still crash the SDRplay
+service (and Trunk-Recorder with it). `cat /proc/buddyinfo` shows it: zeros in
+the right-hand columns of the "Normal" line mean no large blocks are free.
+This happens when RAM is short (check `free -h` for heavy swap use) and gets
+worse the longer the PC runs. Telling Linux to keep more memory free and to
+tidy it in the background helps:
+
+```
+printf 'vm.min_free_kbytes = 262144\nvm.compaction_proactiveness = 50\n' | sudo tee /etc/sysctl.d/90-sdr-memory.conf
+sudo sysctl --system
+```
 
 Check the current limit:
 
