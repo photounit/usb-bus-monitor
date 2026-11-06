@@ -156,6 +156,8 @@ pub struct Topology {
     /// The kernel's cap on memory for all programs' USB transfer buffers
     /// together (usbcore.usbfs_memory_mb). 0 means no limit.
     pub usbfs_memory_mb: Option<u32>,
+    /// Free memory in large blocks, from /proc.
+    pub memory: Option<crate::memory::MemInfo>,
 }
 
 impl Topology {
@@ -443,7 +445,10 @@ pub fn scan(sys_root: &Path, ids: &IdDb) -> std::io::Result<Topology> {
     let board = format!("{} {}", read(&dmi.join("board_vendor")), read(&dmi.join("board_name"))).trim().to_string();
     controllers.sort_by_key(|c| c.buses.first().map(|b| b.busnum).unwrap_or(0));
     let usbfs_memory_mb = read(&sys_root.join("module/usbcore/parameters/usbfs_memory_mb")).parse().ok();
-    Ok(Topology { board, controllers, usbfs_memory_mb })
+    // A test copy of /sys keeps its fake /proc beside it.
+    let proc_root = if sys_root == Path::new("/sys") { PathBuf::from("/proc") } else { sys_root.join("proc") };
+    let memory = crate::memory::read(&proc_root);
+    Ok(Topology { board, controllers, usbfs_memory_mb, memory })
 }
 
 #[cfg(test)]

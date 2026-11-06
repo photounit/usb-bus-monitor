@@ -172,6 +172,12 @@ printf 'vm.min_free_kbytes = 262144\nvm.compaction_proactiveness = 50\n' | sudo 
 sudo sysctl --system
 ```
 
+The app watches for this itself: when SDRs are plugged in and less than 64 MB
+of free memory is left in blocks of 512 KB or more, "Right now" shows an amber
+warning (red below 8 MB) with how much is free and how much swap is in use.
+Closing programs you don't need on that PC, or rebooting, clears it. If it
+keeps coming back within a day or two, the PC needs more RAM.
+
 Check the current limit:
 
 ```

@@ -25,6 +25,11 @@ const ERROR_EVENT_GAP: Duration = Duration::from_secs(30);
 const RECENT_ERRORS: Duration = Duration::from_secs(60);
 const STOPPED_ACTIVE_FOR: Duration = Duration::from_secs(60);
 const MAX_EVENTS: usize = 2000;
+/// Below this much free memory in large blocks, USB transfers start failing.
+const LARGE_FREE_LOW: u64 = 64 << 20;
+const LARGE_FREE_CRITICAL: u64 = 8 << 20;
+/// Back above this, the shortage is over.
+const LARGE_FREE_OK: u64 = 128 << 20;
 /// How long a program's repeated log message is kept to one history entry.
 const REPEAT_GAP: Duration = Duration::from_secs(60);
 /// How long running out of USB buffer memory stays on the "Right now" list.
@@ -104,6 +109,8 @@ pub struct Watcher {
     /// Program log messages already in the history, to collapse repeats.
     repeats: HashMap<String, (Instant, u32)>,
     last_usb_memory_error: Option<Instant>,
+    /// Whether the large-block memory shortage has been logged.
+    memory_low: bool,
     /// Short gaps in each SDR's USB data since the monitor started, by device.
     pub dips: HashMap<String, u32>,
     /// When each SDR last had a gap, and when one was last written to the history.
@@ -179,6 +186,7 @@ impl Watcher {
             last_lost_event: None,
             repeats: HashMap::new(),
             last_usb_memory_error: None,
+            memory_low: false,
             dips: HashMap::new(),
             last_dip: HashMap::new(),
             last_dip_event: HashMap::new(),
@@ -320,6 +328,7 @@ impl Watcher {
         let now = Instant::now();
 
         self.check_usb_memory(topo, now, &mut active);
+        self.check_large_free(topo, &mut active);
 
         for d in topo.all_devices() {
             if d.below_capable_speed() {
@@ -351,6 +360,40 @@ impl Watcher {
 
         active.sort_by(|a, b| b.severity.cmp(&a.severity));
         self.active = active;
+    }
+
+    /// USB transfers need unbroken blocks of memory. When free memory is short
+    /// and fragmented, SDR software gets errno 12 and the SDRplay service can
+    /// crash; warn while there is still time to free memory or reboot.
+    fn check_large_free(&mut self, topo: &Topology, active: &mut Vec<Issue>) {
+        let Some(m) = &topo.memory else { return };
+        if topo.sdr_count() == 0 {
+            return;
+        }
+        let mb = |b: u64| b as f64 / 1_048_576.0;
+        let detail = format!(
+            "{:.0} MB free in large blocks, {:.1} GB available, {:.1} GB of swap in use",
+            mb(m.large_free),
+            mb(m.available) / 1024.0,
+            mb(m.swap_used) / 1024.0
+        );
+        if m.large_free < LARGE_FREE_LOW {
+            let severity = if m.large_free < LARGE_FREE_CRITICAL { Severity::Problem } else { Severity::Warning };
+            if !self.memory_low {
+                self.memory_low = true;
+                self.event(severity, format!("Memory for USB transfers is running low ({detail})"));
+            }
+            active.push(Issue {
+                severity,
+                text: format!(
+                    "Memory for USB transfers is running low ({detail}). SDR software may start failing with errno 12; close programs you don't need or reboot (see README)"
+                ),
+                target: None,
+            });
+        } else if self.memory_low && m.large_free >= LARGE_FREE_OK {
+            self.memory_low = false;
+            self.event(Severity::Info, format!("Memory for USB transfers is back to normal ({detail})"));
+        }
     }
 
     /// Programs reading SDRs through libusb share one kernel cap on transfer
@@ -658,6 +701,7 @@ mod tests {
         Topology {
             board: String::new(),
             usbfs_memory_mb: None,
+            memory: None,
             controllers: vec![Controller {
                 pci_addr: "0000:00:14.0".into(),
                 name: "Intel".into(),
@@ -742,6 +786,35 @@ mod tests {
         w.on_sample(&t, &Rates::default(), &traffic::Counters::default(), &procs::Tracker::default(), true);
         assert_eq!(w.active[0].severity, Severity::Warning);
         assert!(w.active[0].text.contains("although the limit is 1000 MB"), "{}", w.active[0].text);
+    }
+
+    #[test]
+    fn warns_when_large_free_memory_runs_low() {
+        let mut w = Watcher::with_log(None);
+        let mut t = topo(vec![dev("2-5", 4, Some("bladeRF 2.0"), vec![])]);
+        let mem = |mb: u64| Some(crate::memory::MemInfo { large_free: mb << 20, available: 5 << 30, swap_used: 3 << 30 });
+        let sample = |w: &mut Watcher, t: &Topology| w.on_sample(t, &Rates::default(), &traffic::Counters::default(), &procs::Tracker::default(), true);
+
+        t.memory = mem(4000);
+        sample(&mut w, &t);
+        assert!(w.active.is_empty());
+
+        t.memory = mem(2);
+        sample(&mut w, &t);
+        sample(&mut w, &t);
+        assert_eq!(w.active[0].severity, Severity::Problem);
+        assert!(w.active[0].text.contains("2 MB free in large blocks"), "{}", w.active[0].text);
+        // Logged once, not every second.
+        assert_eq!(texts(&w).iter().filter(|t| t.contains("running low")).count(), 1);
+
+        t.memory = mem(40);
+        sample(&mut w, &t);
+        assert_eq!(w.active[0].severity, Severity::Warning);
+
+        t.memory = mem(500);
+        sample(&mut w, &t);
+        assert!(w.active.is_empty());
+        assert!(texts(&w)[0].contains("back to normal"));
     }
 
     #[test]
