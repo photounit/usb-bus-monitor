@@ -22,6 +22,9 @@ const BUSY_SECS: u32 = 3;
 /// SDRs below this rate are treated as idle rather than streaming.
 const STREAMING: f64 = 500_000.0;
 const ERROR_EVENT_GAP: Duration = Duration::from_secs(30);
+/// Seconds (samples) to wait before deciding whether new transfer errors
+/// came with a stream stopping or starting.
+const ERROR_SETTLE: u32 = 3;
 const RECENT_ERRORS: Duration = Duration::from_secs(60);
 const STOPPED_ACTIVE_FOR: Duration = Duration::from_secs(60);
 const MAX_EVENTS: usize = 2000;
@@ -102,8 +105,12 @@ pub struct Watcher {
     hot: HashMap<String, u32>,
     streams: HashMap<String, Stream>,
     prev_errors: HashMap<(u16, u8), u64>,
-    pending_errors: HashMap<String, (u64, Instant)>,
+    /// New errors per device not judged yet, and samples since the first arrived.
+    pending_errors: HashMap<String, (u64, u32)>,
     last_error: HashMap<String, Instant>,
+    last_error_event: HashMap<String, Instant>,
+    /// Errors counted but not yet written to the history, by device.
+    unlogged_errors: HashMap<String, u64>,
     prev_lost: u64,
     last_lost_event: Option<Instant>,
     /// Program log messages already in the history, to collapse repeats.
@@ -182,6 +189,8 @@ impl Watcher {
             prev_errors: HashMap::new(),
             pending_errors: HashMap::new(),
             last_error: HashMap::new(),
+            last_error_event: HashMap::new(),
+            unlogged_errors: HashMap::new(),
             prev_lost: 0,
             last_lost_event: None,
             repeats: HashMap::new(),
@@ -345,7 +354,7 @@ impl Watcher {
                 self.check_controller(c, rates, &mut active);
             }
             self.check_streams(topo, rates, now, &mut active);
-            self.check_errors(topo, counters, now, &mut active);
+            self.check_errors(topo, rates, counters, now, &mut active);
             self.check_programs(topo, procs, &mut active);
 
             if counters.lost_events > self.prev_lost {
@@ -535,7 +544,11 @@ impl Watcher {
             // (so it wasn't the start of a stop): the SDR had to throw samples
             // away because nothing collected them in time.
             let before_last = h[h.len() - 2];
-            if prev == Stream::Normal && next == Stream::Normal && baseline > STREAMING && before_last < DIP * baseline && last >= DIP * baseline {
+            // Not a stop (near zero) or a change of sample rate (the stream
+            // coming back at a different rate): both happen when a program
+            // restarts the SDR.
+            let same_rate = (last - baseline).abs() < (1.0 - DIP) * baseline;
+            if prev == Stream::Normal && baseline > STREAMING && before_last < DIP * baseline && before_last >= 0.1 * baseline && same_rate {
                 let last = before_last;
                 *self.dips.entry(d.sysname.clone()).or_default() += 1;
                 self.last_dip.insert(d.sysname.clone(), now);
@@ -584,21 +597,41 @@ impl Watcher {
         }
     }
 
-    fn check_errors(&mut self, topo: &Topology, counters: &traffic::Counters, now: Instant, active: &mut Vec<Issue>) {
+    fn check_errors(&mut self, topo: &Topology, rates: &Rates, counters: &traffic::Counters, now: Instant, active: &mut Vec<Issue>) {
         for d in topo.all_devices() {
             let key = (d.busnum as u16, d.devnum as u8);
             let Some(c) = counters.devices.get(&key) else { continue };
             let before = self.prev_errors.insert(key, c.errors).unwrap_or(c.errors);
             let new = c.errors.saturating_sub(before);
             if new > 0 {
-                self.last_error.insert(d.sysname.clone(), now);
-                let p = self.pending_errors.entry(d.sysname.clone()).or_insert((0, now - ERROR_EVENT_GAP));
-                p.0 += new;
-                if now.duration_since(p.1) >= ERROR_EVENT_GAP {
-                    let n = p.0;
-                    *p = (0, now);
-                    let worst = c.error_codes.iter().max_by_key(|(_, n)| **n).map(|(code, _)| traffic::error_name(*code)).unwrap_or_default();
-                    self.event(Severity::Warning, format!("{n} transfer errors on {} ({}), mostly {worst}", label(d), place(d)));
+                self.pending_errors.entry(d.sysname.clone()).or_insert((0, 0)).0 += new;
+            }
+            // Wait a few seconds before judging new errors, so we can see
+            // whether they came with the stream stopping or starting.
+            if let Some(p) = self.pending_errors.get_mut(&d.sysname) {
+                p.1 += 1;
+            }
+            if let Some(&(n, waited)) = self.pending_errors.get(&d.sysname)
+                && waited > ERROR_SETTLE
+            {
+                self.pending_errors.remove(&d.sysname);
+                let worst = c.error_codes.iter().max_by_key(|(_, n)| **n).map(|(code, _)| traffic::error_name(*code)).unwrap_or_default();
+                if stream_changed(rates, d) {
+                    // A program closing or reopening an SDR often aborts the
+                    // transfers in flight, which shows up as a few errors.
+                    self.event(
+                        Severity::Info,
+                        format!("{n} transfer errors on {} ({}) while its stream was stopping or starting, which is normal when a program restarts it", label(d), place(d)),
+                    );
+                } else {
+                    self.last_error.insert(d.sysname.clone(), now);
+                    let total = self.unlogged_errors.entry(d.sysname.clone()).or_default();
+                    *total += n;
+                    if self.last_error_event.get(&d.sysname).is_none_or(|t| now.duration_since(*t) >= ERROR_EVENT_GAP) {
+                        let n = std::mem::take(total);
+                        self.last_error_event.insert(d.sysname.clone(), now);
+                        self.event(Severity::Warning, format!("{n} transfer errors on {} ({}), mostly {worst}", label(d), place(d)));
+                    }
                 }
             }
             if self.last_error.get(&d.sysname).is_some_and(|t| now.duration_since(*t) < RECENT_ERRORS) {
@@ -644,6 +677,16 @@ impl Watcher {
             active.push(Issue { severity: Severity::Warning, text, target: devs.first().map(|d| d.sysname.clone()) });
         }
     }
+}
+
+/// Whether a device's data rate stopped, started or changed a lot in the last
+/// several seconds, as when a program restarts an SDR.
+fn stream_changed(rates: &Rates, d: &Device) -> bool {
+    let Some(s) = rates.device(d) else { return false };
+    let recent: Vec<f64> = s.history.iter().rev().take(8).copied().collect();
+    let max = recent.iter().copied().fold(0.0, f64::max);
+    let min = recent.iter().copied().fold(f64::INFINITY, f64::min);
+    max > STREAMING && min < 0.5 * max
 }
 
 /// " (bladeRF 2.0)" when a kernel line starts with a device we know, e.g.
@@ -865,6 +908,38 @@ mod tests {
         feed(&mut w, &mut rates, 18.0e6, 4);
         assert_eq!(w.active.len(), 1, "{:?}", w.active);
         assert_eq!(w.active[0].severity, Severity::Warning);
+    }
+
+    #[test]
+    fn restart_is_not_a_gap_or_a_fault() {
+        let mut w = Watcher::with_log(None);
+        let t = topo(vec![dev("2-8.2", 5, Some("Airspy"), vec![])]);
+        let mut rates = Rates::default();
+        let mut counters = traffic::Counters::default();
+        counters.devices.insert((2, 5), traffic::DevCounters::default());
+        let feed = |w: &mut Watcher, rates: &mut Rates, counters: &traffic::Counters, v: f64, secs: usize| {
+            for _ in 0..secs {
+                rates.devices.entry("2-8.2".into()).or_insert_with(Series::default).push(v);
+                w.on_sample(&t, rates, counters, &procs::Tracker::default(), true);
+            }
+        };
+        feed(&mut w, &mut rates, &counters, 9.0e6, 20);
+        // What Bill saw on rdio: TRP restarted, a few protocol errors, one
+        // near-empty second, and the Airspy back at a different rate.
+        counters.devices.get_mut(&(2, 5)).unwrap().errors = 4;
+        counters.devices.get_mut(&(2, 5)).unwrap().error_codes.insert(-71, 4);
+        feed(&mut w, &mut rates, &counters, 92.0, 1);
+        feed(&mut w, &mut rates, &counters, 18.0e6, 10);
+        assert_eq!(w.dips.get("2-8.2"), None, "{:?}", texts(&w));
+        assert!(w.active.is_empty(), "{:?}", w.active);
+        assert!(texts(&w).iter().any(|e| e.contains("while its stream was stopping or starting")), "{:?}", texts(&w));
+
+        // The same errors in the middle of a steady stream are a warning.
+        feed(&mut w, &mut rates, &counters, 18.0e6, 10);
+        counters.devices.get_mut(&(2, 5)).unwrap().errors = 7;
+        feed(&mut w, &mut rates, &counters, 18.0e6, 4);
+        assert!(texts(&w)[0].starts_with("3 transfer errors on"), "{:?}", texts(&w));
+        assert_eq!(w.active.len(), 1, "{:?}", w.active);
     }
 
     #[test]
